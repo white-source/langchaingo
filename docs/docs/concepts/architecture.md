@@ -519,3 +519,133 @@ func TestWithDatabase(t *testing.T) {
 ```
 
 This architecture follows Go's principles of simplicity, clarity, and performance.
+
+
+# 核心链路 ASCII 时序图
+```text
+用户代码          chains.Call()     Memory          PromptTemplate    LLM              Callbacks
+   │                  │               │                  │              │                  │
+   │─ Call(inputs) ──►│               │                  │              │                  │
+   │                  │─ Load() ─────►│                  │              │                  │
+   │                  │◄─ history ────│                  │              │                  │
+   │                  │               │                  │              │                  │
+   │                  │─ merge inputs+history ──────────►│              │                  │
+   │                  │◄─ PromptValue ───────────────────│              │                  │
+   │                  │                                                 │                  │
+   │                  │─ HandleLLMStart ──────────────────────────────────────────────────►│
+   │                  │─ GenerateContent([]MessageContent) ────────────►│                  │
+   │                  │◄─ ContentResponse ──────────────────────────────│                  │
+   │                  │─ HandleLLMEnd ────────────────────────────────────────────────────►│
+   │                  │                                                                    │
+   │                  │─ Save(inputs, outputs) ──────────►│              │                  │
+   │◄─ outputs ───────│               │                  │              │                  │
+
+   ```
+
+   # Agent Loop
+   ```text
+   用户代码       Executor          Agent.Plan()      LLMChain        Tool         Callbacks
+   │              │                   │               │              │               │
+   │─ Run(q) ────►│                   │               │              │               │
+   │              │                   │               │              │               │
+   │              │─ HandleChainStart ─────────────────────────────────────────────►│
+   │              │                   │               │              │               │
+   │              │════════════════ Loop(i=0..MaxIterations) ══════════════════════════
+   │              │                   │               │              │               │
+   │              │─ Plan(steps,inputs)──────────────►│               │               │
+   │              │                   │               │               │               │
+   │              │                   │─ constructMrklScratchPad(steps)               │
+   │              │                   │  ┌──────────────────────────┐                 │
+   │              │                   │  │ scratchpad =              │                │
+   │              │                   │  │  Thought: ...             │                │
+   │              │                   │  │  Action: tool_name        │                │
+   │              │                   │  │  Action Input: ...        │                │
+   │              │                   │  │  Observation: <上轮结果>  │                │
+   │              │                   │  └──────────────────────────┘                 │
+   │              │                   │─ Predict(fullInputs) ────────►│               │
+   │              │                   │                               │─ LLM.Generate►│─ HandleLLMStart►│
+   │              │                   │                               │◄─ text ────────│                 │
+   │              │                   │◄─ output text ────────────────│               │                 │
+   │              │                   │                               │              │                  │
+   │              │                   │─ parseOutput(text) ─────────────────────────────────────────────
+   │              │                   │  ├─ 含 "Final Answer:" ──────► AgentFinish ──────────────────────
+   │              │                   │  └─ 含 "Action: xxx" ────────► []AgentAction ──────────────────
+   │              │◄─ actions/finish ─│               │              │               │
+   │              │                   │               │              │               │
+   │              │  [if AgentFinish]─────────────────────────────────────────────────────────────────
+   │              │─ HandleAgentFinish ────────────────────────────────────────────►│
+   │◄─ result ────│                   │               │              │               │
+   │              │                   │               │              │               │
+   │              │  [if AgentAction] ─────────────────────────────────────────────────────────────────
+   │              │─ HandleAgentAction ────────────────────────────────────────────►│
+   │              │─ tool.Call(input) ──────────────────────────────►│               │
+   │              │─ HandleToolStart ──────────────────────────────────────────────►│
+   │              │◄─ observation ─────────────────────────────────────│               │
+   │              │─ HandleToolEnd ────────────────────────────────────────────────►│
+   │              │                   │               │              │               │
+   │              │  steps = append(steps, AgentStep{Action, Observation})           │
+   │              │                   │               │              │               │
+   │              │════════════════ 下一轮 Loop ══════════════════════════════════════
+   │              │                   │               │              │               │
+   │              │─ HandleChainEnd ──────────────────────────────────────────────►│
+
+```
+
+   # 核心数据流
+```text
+   Round 0 传给 LLM 的 Prompt:
+┌────────────────────────────────────────────────────────┐
+│  System: 你是一个 Agent，你有以下工具...                  │
+│  Human:  25 乘以 4 是多少？                              │
+│  agent_scratchpad: ""   ← 空                           │
+└────────────────────────────────────────────────────────┘
+          ▼ LLM 输出
+  "Thought: 需要计算\nAction: calculator\nAction Input: 25 * 4"
+          ▼ StopWord "\nObservation:" 截断
+          ▼ tool.Call("25 * 4") → "100"   ← 真实 Observation
+
+Round 1 传给 LLM 的 Prompt:
+┌────────────────────────────────────────────────────────┐
+│  System: 你是一个 Agent，你有以下工具...                  │
+│  Human:  25 乘以 4 是多少？                              │
+│  agent_scratchpad:                                      │
+│    "Thought: 需要计算                                    │
+│     Action: calculator                                  │
+│     Action Input: 25 * 4                               │
+│     Observation: 100"   ← 上轮结果注入                   │
+└────────────────────────────────────────────────────────┘
+          ▼ LLM 输出
+  "Final Answer: 25 乘以 4 等于 100"
+          ▼ AgentFinish → 退出循环
+
+```
+# 模块层级关系
+```text
+（整个框架的"大脑"是 scratchpad —— 每轮把 Action.Log + Observation 拼成字符串，下轮塞回 Prompt，让 LLM 以拼接的文本方式"记住"已发生的事情，这就是 ReAct 的实现本质。）
+┌──────────────────────────────────────────────────────┐
+│                    用户代码                            │
+└───────────────────────┬──────────────────────────────┘
+                        │ chains.Run() / agents.Run()
+┌───────────────────────▼──────────────────────────────┐
+│              Executor (chains.Chain)                  │
+│  ┌─────────────────────────────────────────────────┐  │
+│  │              Agent Loop                          │  │
+│  │   Plan() → doAction() → append steps → repeat  │  │
+│  └──────────────┬──────────────────┬───────────────┘  │
+│                 │                  │                  │
+│         Agent.Plan()          Tool.Call()            │
+│         (策略，可替换)         (命令，可扩展)           │
+└────────┬────────┴──────────────────┴──────────────────┘
+         │
+┌────────▼──────────────────────────────────────────────┐
+│                  LLMChain                              │
+│   Memory.Load → Prompt.Format → LLM.Generate          │
+│              → Memory.Save                            │
+└────────┬──────────────────────────────────────────────┘
+         │ callbacks 横切所有层
+┌────────▼──────────────────────────────────────────────┐
+│              Callbacks.Handler（观察者）                │
+│  HandleChainStart/End  HandleLLMStart/End              │
+│  HandleToolStart/End   HandleAgentAction/Finish        │
+└───────────────────────────────────────────────────────┘
+```
